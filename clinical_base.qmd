@@ -1,5 +1,5 @@
 ---
-title: "Clinical Base Model - LightGBM"
+title: "Clinical Base Model - XGBOOST"
 format: html
 author: "Chaewon Oh"
 ---
@@ -23,7 +23,7 @@ dir.create("predictions", showWarnings = FALSE)
 # keep ids for saving splits later 
 ids_all <- clinical_master |> dplyr::select(patient_id, sample_id)
 dat <- clinical_master |>
-  dplyr::select(-patient_id, -sample_id) |>
+  dplyr::select(-patient_id, -sample_id, -vital) |>
   mutate(across(where(is.character), as.factor))|>
   filter(!is.na(os_months), !is.na(os_event))
 
@@ -90,6 +90,9 @@ X_test <- X_test[, colnames(X_train), drop = FALSE]
 
 stopifnot(nrow(X_train) == length(time_train), length(time_train) == length(event_train))
 stopifnot(nrow(X_test)  == length(time_test),  length(time_test)  == length(event_test))
+stopifnot(!any(grepl("vital", colnames(pred2), ignore.case = TRUE)))
+stopifnot(!any(grepl("vital", colnames(X_train), ignore.case = TRUE)))
+stopifnot(!any(grepl("vital", colnames(X_test),  ignore.case = TRUE)))
 
 ```
 
