@@ -1,0 +1,216 @@
+---
+title: "Clinical Base Model - LightGBM"
+format: html
+author: "Chaewon Oh"
+---
+1. Load packages 
+```{r}
+library(xgboost)
+library(dplyr)
+library(tidyverse)
+library(survival)
+library(survminer)
+setwd("C:/Users/USER/OneDrive/바탕 화면/Projects - R & Python/R Projects/ENAR")
+clinical_master <- read.csv("output/clean_full/clinical_master.csv")
+dir.create("splits", showWarnings = FALSE)
+dir.create("models", showWarnings = FALSE)
+dir.create("predictions", showWarnings = FALSE)
+
+```
+
+2. Pre-cleaning before model fitting
+```{r}
+# keep ids for saving splits later 
+ids_all <- clinical_master |> dplyr::select(patient_id, sample_id)
+dat <- clinical_master |>
+  dplyr::select(-patient_id, -sample_id) |>
+  mutate(across(where(is.character), as.factor))|>
+  filter(!is.na(os_months), !is.na(os_event))
+
+time <- dat$os_months
+event <- dat$os_event
+
+init_pred <- dat |>dplyr::select(-os_months, -os_event)
+# fators < 2 levels 
+bad <- names(init_pred)[sapply(init_pred, \(x) is.factor(x) && nlevels(x) < 2)]
+bad
+# sex and sample_type
+pred <- init_pred |> dplyr::select(-sex, -sample_type)
+dim(pred)
+
+keep <- complete.cases(pred)
+
+pred2<- pred[keep, , drop = FALSE]
+time2<- time[keep]
+event2 <- event[keep]
+
+ids2 <- ids_all[ keep, , drop = FALSE]
+
+```
+3. Define train/test split(80/20 ratios)
+
+```{r}
+set.seed(123)
+n <- nrow(pred2)
+idx_train <- sample.int(n, size = floor(0.8 *n))
+saveRDS(idx_train, "splits/idx_train.rds")
+
+train_ids <- ids2[idx_train, , drop = FALSE]
+test_ids <- ids2[-idx_train , , drop = FALSE]
+
+write.csv(train_ids, "splits/train_ids.csv")
+write.csv(test_ids, "splits/test_ids.csv")
+
+pred_train <- pred2[idx_train, , drop = FALSE]
+time_train <- time2[idx_train]
+event_train <- event2[idx_train]
+
+pred_test  <- pred2[-idx_train, , drop = FALSE]
+time_test  <- time2[-idx_train]
+event_test <- event2[-idx_train]
+```
+
+4. Build design matrices
+```{r}
+X_train <- model.matrix(~. -1, data = pred_train)
+tt <- terms(~ . -1, data = pred_train)
+# terms to lock the training encoding 
+X_test <- model.matrix(tt, data = pred_test)
+
+# Another safety feature 
+missing_cols <- setdiff(colnames(X_train), colnames(X_test))
+if (length(missing_cols) > 0) {
+  X_test <- cbind(
+    X_test,
+    matrix(0, nrow(X_test), length(missing_cols),
+           dimnames = list(NULL, missing_cols))
+  )
+}
+X_test <- X_test[, colnames(X_train), drop = FALSE]
+
+stopifnot(nrow(X_train) == length(time_train), length(time_train) == length(event_train))
+stopifnot(nrow(X_test)  == length(time_test),  length(time_test)  == length(event_test))
+
+```
+
+5. Prepare label and XGBoost data objects 
+```{r}
+label_cox <- ifelse(event_train ==1, time_train, -time_train)
+dtrain <- xgb.DMatrix(data = X_train, label = label_cox)
+dtest <- xgb.DMatrix(data = X_test)
+params <- list(objective = "survival:cox", eval_metric = "cox-nloglik")
+
+```
+
+6. Hyperparameter tuning (grid search)
+Over 54 parameter combinations using 5-fold cross validation with early stopping 
+```{r}
+set.seed(123)
+
+base_param <- list(objective = "survival:cox", eval_metric = "cox-nloglik")
+grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(2, 4, 6),
+  subsample = c(0.5, 0.7, 1.0),
+  colsample_bytree = c(0.7, 1.0)
+)
+
+out <-vector("list", nrow(grid))
+
+start = Sys.time()
+for (i in seq_len(nrow(grid))) {
+  params_i <- c(base_param, as.list(grid[i, ]))
+  
+  cv_i <- xgb.cv(params = params_i, 
+  data = dtrain, nrounds = 1000, nfold = 5, early_stopping_rounds = 50, 
+  verbose = 0 )
+  
+  out[[i]] <- tibble::tibble(
+    trial = i, best_iteration = cv_i$best_iteration, 
+    best_score = cv_i$evaluation_log[cv_i$best_iteration,
+                                     "test_cox_nloglik_mean"
+    ], eta = grid$eta[i], max_depth = grid$max_depth[i], subsample = grid$subsample[i], colsample_bytree = grid$colsample_bytree[i]
+    
+  )
+  
+}
+end <- Sys.time()
+print(paste("Run time: ", end- start))
+# Approximately 5 minutes to run the hyperparameter tuning 
+res <- dplyr::bind_rows(out) |> dplyr::arrange(best_score)
+best <- res[1, ]
+best
+
+
+```
+7. Final Model Building
+```{r}
+
+best_params <- c(base_param, as.list(best[, c("eta", "max_depth", "subsample", "colsample_bytree")]))
+final_bst <- xgb.train(params = best_params, data= dtrain, nrounds = best$best_iteration, verbose = 0)
+xgb.save(final_bst, "xgb_cox.json")
+write.csv(best, "models/clinical_best_params.csv", row.names = FALSE)
+```
+8. Predict 
+```{r}
+risk_test <- predict(final_bst, dtest)
+head(risk_test)
+```
+9. Evaluate concordance 
+```{r}
+risk_test_vec <- as.numeric(risk_test)
+
+df_eval <- data.frame(
+  time = as.numeric(time_test),
+  event = as.integer(event_test),
+  risk = risk_test_vec
+)
+
+df_eval <- df_eval[complete.cases(df_eval),]
+# stopifnot(nrow(df_eval) == length(df_eval$risk))
+
+# Flip sign because xgb cox predicts higher = worse 
+cidx_test <- survival::concordance(Surv(df_eval$time, df_eval$event) ~ I(-df_eval$risk), data = df_eval)$concordance
+cidx_test 
+
+pred_out <- data.frame(
+  patient_id = test_ids$patient_id,
+  sample_id = test_ids$sample_id,
+  time = df_eval$time,
+  event = df_eval$event,
+  risk_clinical = df_eval$risk
+)
+
+write.csv(pred_out, "predictions/clinical_test_risk.csv", row.names = FALSE)
+```
+11. Plot Kaplan-Meier Curve 
+```{r}
+df_eval$risk_group <- cut(df_eval$risk,
+                          breaks = quantile(df_eval$risk, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                          labels = c("Low Risk","Low-Medium Risk", "Medium - High Risk", "High Risk"),
+                          include.lowest= TRUE)
+
+fit_km <- survfit(Surv(time, event) ~ risk_group, data = df_eval)
+
+ggsurvplot(
+  fit_km,
+  data = df_eval,
+  risk.table = TRUE,
+  pval = TRUE,
+  risk.table.height = 0.35,
+  risk.table.y.text = FALSE,
+  risk.table.fontsize = 3, 
+  
+  break.time.by = 50,
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  
+  
+  legend.title = "Predicted risk group",
+  legend.labs = levels(df_eval$risk_group),
+  
+  ggtheme = theme_classic(),
+  tables.theme = theme_cleantable()
+)
+```
+
