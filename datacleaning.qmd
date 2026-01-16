@@ -1,0 +1,443 @@
+---
+title: "Breast Cancer Survival Prediction with Clinical and Multi Omics Data"
+author: ""
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+    date-format: iso
+    theme: materia
+    
+---
+
+
+
+# R Setup
+
+```{r}
+# =========================
+# (1) R Setup
+# =========================
+
+# Quarto option: hide package startup messages
+#| message: false
+
+# For reports and tables
+library(knitr)
+
+# Stats helper tools
+library(easystats)
+
+# Data wrangling tools
+library(tidyverse)
+
+
+```
+
+
+
+# Import Files
+```{r}
+# =========================
+# (2) Import Files
+# =========================
+
+# Project folders
+base_dir   <- "C:/coding/R/datafest"          # Project root
+input_dir  <- file.path(base_dir, "input")    # Raw input folder
+output_dir <- file.path(base_dir, "output")   # Output folder
+
+# Output subfolders
+out_clean_full   <- file.path(output_dir, "clean_full")     # Full cleaned outputs
+out_clean_common <- file.path(output_dir, "clean_common")   # Common cleaned outputs
+
+# Create folders if missing
+dir.create(out_clean_full,   showWarnings = FALSE, recursive = TRUE)
+dir.create(out_clean_common, showWarnings = FALSE, recursive = TRUE)
+
+# Read one tab-delimited file
+read_one <- function(x) {
+  f <- file.path(input_dir, x)                # Build full path
+  read.delim(
+    f,                                        # File path
+    sep = "\t",                               # Tab separated
+    header = TRUE,                            # First row is header
+    stringsAsFactors = FALSE,                 # Keep strings as character
+    comment.char = "#",                       # Ignore comment lines
+    quote = "",                               # No quote parsing
+    fill = TRUE,                              # Fill missing columns
+    check.names = FALSE                       # Keep original column names
+  )
+}
+
+# Read five raw tables
+patient_raw <- read_one("data_clinical_patient.txt")             # Patient-level clinical
+sample_raw  <- read_one("data_clinical_sample.txt")              # Sample-level clinical
+mrna_raw    <- read_one("data_mrna_illumina_microarray.txt")     # mRNA expression
+meth_raw    <- read_one("data_methylation_promoters_rrbs.txt")   # Methylation
+mut_raw     <- read_one("data_mutations.txt")                    # Mutations
+
+# Quick check: column names
+list(
+  patient_cols = names(patient_raw),                              # Patient columns
+  sample_cols  = names(sample_raw),                               # Sample columns
+  mrna_cols    = names(mrna_raw)[1:min(30, ncol(mrna_raw))],       # First 30 mRNA cols
+  meth_cols    = names(meth_raw)[1:min(30, ncol(meth_raw))],       # First 30 meth cols
+  mut_cols     = names(mut_raw)                                   # Mutation columns
+)
+
+# Quick check: table size
+list(
+  patient_dim = dim(patient_raw),                                 # (rows, cols)
+  sample_dim  = dim(sample_raw),
+  mrna_dim    = dim(mrna_raw),
+  meth_dim    = dim(meth_raw),
+  mut_dim     = dim(mut_raw)
+)
+
+# Peek key IDs and outcomes
+patient_raw |>
+  select(PATIENT_ID, AGE_AT_DIAGNOSIS, OS_MONTHS, OS_STATUS, VITAL_STATUS) |>
+  slice_head(n = 6)
+
+sample_raw |>
+  select(PATIENT_ID, SAMPLE_ID, SAMPLE_TYPE, TUMOR_STAGE, GRADE, TUMOR_SIZE, TMB_NONSYNONYMOUS) |>
+  slice_head(n = 6)
+
+# Omics are large: show only first few columns
+mrna_raw |> select(1:min(4, ncol(mrna_raw))) |> slice_head(n = 6)
+meth_raw |> select(1:min(4, ncol(meth_raw))) |> slice_head(n = 6)
+mut_raw  |> select(1:min(8, ncol(mut_raw)))  |> slice_head(n = 6)
+
+# Check common category values (find Unknown-like values)
+patient_raw |>
+  count(OS_STATUS, sort = TRUE) |>
+  slice_head(n = 15)
+
+sample_raw |>
+  count(TUMOR_STAGE, sort = TRUE) |>
+  slice_head(n = 15)
+
+
+
+```
+
+
+# Standardize Missing Tokens
+```{r}
+# =========================
+# (3) Standardize Missing Tokens
+# =========================
+
+# Common "missing" strings to convert into real NA
+missing_tokens <- c(
+  "", "NA", "N/A", "NULL",
+  "Not Available", "[Not Available]",
+  "Unknown", "[Unknown]"
+)
+
+# Replace missing tokens in character columns with NA
+standardize_missing <- function(df, tokens = missing_tokens) {
+  tok <- unique(tolower(tokens))                 # Normalize token list to lower-case
+
+  df |>
+    mutate(
+      across(
+        where(is.character),                     # Only character columns
+        \(v) {
+          v2 <- trimws(v)                        # Trim spaces
+          case_when(
+            is.na(v2) ~ NA_character_,           # Keep NA as NA
+            tolower(v2) %in% tok ~ NA_character_,# Token -> NA
+            TRUE ~ v2                            # Otherwise keep cleaned string
+          )
+        }
+      )
+    )
+}
+
+# -----------------------------
+# BEFORE vs AFTER token audit
+# -----------------------------
+
+# Count NA, empty strings, and token strings per character column
+token_audit <- function(df, tokens = missing_tokens) {
+  tok <- unique(tolower(tokens))                 # Normalize token list
+  char_cols <- names(df)[vapply(df, is.character, logical(1))]  # Character columns
+
+  tibble(col = char_cols) |>
+    mutate(
+      n_rows = nrow(df),                         # Total rows
+      n_na = vapply(char_cols, \(cn) sum(is.na(df[[cn]])), integer(1)),  # NA count
+      n_empty = vapply(char_cols, \(cn) {        # Empty string count
+        v <- df[[cn]]
+        sum(!is.na(v) & trimws(v) == "")
+      }, integer(1)),
+      n_token = vapply(char_cols, \(cn) {        # Token string count
+        v <- df[[cn]]
+        v2 <- trimws(v)
+        sum(!is.na(v2) & tolower(v2) %in% tok)
+      }, integer(1))
+    ) |>
+    arrange(desc(n_token), desc(n_empty), desc(n_na))  # Sort by most "bad" values
+}
+
+# Join BEFORE and AFTER audits, then compute deltas
+compare_audit <- function(before, after) {
+  before |>
+    select(
+      col, n_rows,
+      before_na = n_na, before_empty = n_empty, before_token = n_token
+    ) |>
+    left_join(
+      after |>
+        select(
+          col,
+          after_na = n_na, after_empty = n_empty, after_token = n_token
+        ),
+      by = "col"
+    ) |>
+    mutate(
+      delta_na = after_na - before_na,           # NA increase
+      delta_empty = after_empty - before_empty,  # Empty string change
+      delta_token = after_token - before_token   # Token count change
+    ) |>
+    arrange(delta_token, delta_empty, desc(delta_na))  # Tokens should drop to 0
+}
+
+# Keep BEFORE copies for auditing
+patient_raw_before <- patient_raw               # Patient table before cleaning
+sample_raw_before  <- sample_raw                # Sample table before cleaning
+mrna_raw_before    <- mrna_raw                  # mRNA table before cleaning
+meth_raw_before    <- meth_raw                  # Methylation table before cleaning
+mut_raw_before     <- mut_raw                   # Mutation table before cleaning
+
+# Apply standardization to each table
+patient_raw <- standardize_missing(patient_raw_before)  # Clean patient table
+sample_raw  <- standardize_missing(sample_raw_before)   # Clean sample table
+mrna_raw    <- standardize_missing(mrna_raw_before)     # Clean mRNA table
+meth_raw    <- standardize_missing(meth_raw_before)     # Clean methylation table
+mut_raw     <- standardize_missing(mut_raw_before)      # Clean mutation table
+
+# Audit: show top columns where empty/token existed (before or after)
+audit_patient <- compare_audit(
+  token_audit(patient_raw_before),
+  token_audit(patient_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)                            # Top 30 rows
+
+audit_sample <- compare_audit(
+  token_audit(sample_raw_before),
+  token_audit(sample_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_mrna <- compare_audit(
+  token_audit(mrna_raw_before),
+  token_audit(mrna_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_meth <- compare_audit(
+  token_audit(meth_raw_before),
+  token_audit(meth_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_mut <- compare_audit(
+  token_audit(mut_raw_before),
+  token_audit(mut_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+# Return a quick summary list
+list(
+  patient_audit_top = audit_patient,            # Patient audit top rows
+  sample_audit_top  = audit_sample,             # Sample audit top rows
+  mrna_audit_top    = audit_mrna,               # mRNA audit top rows
+  meth_audit_top    = audit_meth,               # Methylation audit top rows
+  mut_audit_top     = audit_mut                 # Mutation audit top rows
+)
+
+
+```
+
+
+
+# Clean Clinical Data
+```{r}
+# =========================
+# (4) Clean Clinical Data
+# =========================
+
+# Convert OS_STATUS into 0/1/NA event indicator
+make_event <- function(x) {
+  # Make status comparable: character, trimmed, upper-case
+  x2 <- toupper(trimws(as.character(x)))
+  case_when(
+    # Missing stays missing
+    is.na(x2) ~ NA_integer_,
+    # Common numeric prefix encodings
+    str_detect(x2, "^1") ~ 1L,
+    str_detect(x2, "^0") ~ 0L,
+    # Common text encodings
+    str_detect(x2, "DECEASED|DEAD") ~ 1L,
+    str_detect(x2, "LIVING|ALIVE") ~ 0L,
+    # Anything else becomes NA
+    TRUE ~ NA_integer_
+  )
+}
+
+# Patient-level cleaning
+patient_cln <- patient_raw |>
+  transmute(
+    patient_id = as.character(PATIENT_ID),                        # Patient key
+    age_at_dx  = suppressWarnings(as.numeric(AGE_AT_DIAGNOSIS)),   # Age at diagnosis
+    sex        = as.character(SEX),                                # Sex
+    npi        = suppressWarnings(as.numeric(NPI)),                # NPI score
+    nodes_pos  = suppressWarnings(as.numeric(LYMPH_NODES_EXAMINED_POSITIVE)), # Positive nodes
+    chemo      = as.character(CHEMOTHERAPY),                       # Chemo label
+    hormone_tx = as.character(HORMONE_THERAPY),                    # Hormone therapy label
+    radio_tx   = as.character(RADIO_THERAPY),                      # Radiotherapy label
+    surgery    = as.character(BREAST_SURGERY),                     # Surgery label
+    er_ihc     = as.character(ER_IHC),                             # ER IHC label
+    her2_snp6  = as.character(HER2_SNP6),                          # HER2 SNP6 label
+    intclust   = as.character(INTCLUST),                           # Integrative cluster
+    claudin    = as.character(CLAUDIN_SUBTYPE),                    # Claudin subtype
+    threegene  = as.character(THREEGENE),                          # Three-gene subtype
+    os_months  = suppressWarnings(as.numeric(OS_MONTHS)),          # OS time in months
+    os_event   = make_event(OS_STATUS),                            # OS event
+    vital      = as.character(VITAL_STATUS)                        # Vital status text
+  ) |>
+  filter(!is.na(patient_id)) |>
+  filter(!is.na(os_months), os_months >= 0) |>
+  filter(!is.na(os_event)) |>
+  mutate(
+    # Standardize sex values
+    sex = case_when(
+      toupper(trimws(sex)) %in% c("F", "FEMALE") ~ "Female",
+      toupper(trimws(sex)) %in% c("M", "MALE") ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    # Store sex as categorical
+    sex = factor(sex),
+    # Standardize ER IHC to Positive/Negative when possible
+    er_ihc = case_when(
+      str_detect(toupper(er_ihc), "POSIT") ~ "Positive",
+      str_detect(toupper(er_ihc), "NEGAT") ~ "Negative",
+      TRUE ~ er_ihc
+    ),
+    # Standardize HER2 SNP6 categories when possible
+    her2_snp6 = case_when(
+      str_detect(toupper(her2_snp6), "AMPL") ~ "Amplified",
+      str_detect(toupper(her2_snp6), "NEUT") ~ "Neutral",
+      str_detect(toupper(her2_snp6), "LOSS|DEL") ~ "Loss",
+      TRUE ~ her2_snp6
+    )
+  )
+
+# Sample-level cleaning
+sample_cln <- sample_raw |>
+  transmute(
+    patient_id  = as.character(PATIENT_ID),                        # Patient key
+    sample_id   = as.character(SAMPLE_ID),                         # Sample key
+    sample_type = as.character(SAMPLE_TYPE),                       # Sample type text
+    tumor_stage = as.character(TUMOR_STAGE),                       # Stage text
+    grade       = as.character(GRADE),                             # Grade text
+    tumor_size  = suppressWarnings(as.numeric(TUMOR_SIZE)),         # Tumor size
+    er_status   = as.character(ER_STATUS),                         # ER status text
+    pr_status   = as.character(PR_STATUS),                         # PR status text
+    her2_status = as.character(HER2_STATUS),                       # HER2 status text
+    tmb_nonsyn  = suppressWarnings(as.numeric(TMB_NONSYNONYMOUS))   # TMB value
+  ) |>
+  filter(!is.na(patient_id), !is.na(sample_id)) |>
+  mutate(
+    # Standardize ER status to Positive/Negative when possible
+    er_status = case_when(
+      str_detect(toupper(er_status), "POSIT") ~ "Positive",
+      str_detect(toupper(er_status), "NEGAT") ~ "Negative",
+      TRUE ~ er_status
+    ),
+    # Standardize PR status to Positive/Negative when possible
+    pr_status = case_when(
+      str_detect(toupper(pr_status), "POSIT") ~ "Positive",
+      str_detect(toupper(pr_status), "NEGAT") ~ "Negative",
+      TRUE ~ pr_status
+    ),
+    # Standardize HER2 status to Positive/Negative when possible
+    her2_status = case_when(
+      str_detect(toupper(her2_status), "POSIT") ~ "Positive",
+      str_detect(toupper(her2_status), "NEGAT") ~ "Negative",
+      TRUE ~ her2_status
+    )
+  )
+
+# Keep one sample per patient, prefer Primary
+sample_one <- sample_cln |>
+  mutate(is_primary = str_detect(tolower(sample_type), "primary")) |>
+  arrange(patient_id, desc(is_primary), sample_id) |>
+  group_by(patient_id) |>
+  slice(1) |>
+  ungroup() |>
+  select(-is_primary)
+
+# Build master clinical table
+clinical_master <- patient_cln |>
+  inner_join(sample_one, by = "patient_id") |>
+  distinct(patient_id, .keep_all = TRUE)
+
+# Check final dimension
+dim(clinical_master)
+
+# CSV
+readr::write_csv(
+  clinical_master,
+  file.path(out_clean_full, "clinical_master.csv")
+)
+
+```
+
+
+
+## Codebook for clinical_master
+
+| Variable      | Role      | Type        | Description                                                                 | Source |
+|---|---|---|---|---|
+| patient_id    | ID        | string      | Patient identifier used for merges. One sample is kept per patient.         | data_clinical_patient.txt: PATIENT_ID |
+| sample_id     | ID        | string      | Sample identifier for the selected sample per patient.                      | data_clinical_sample.txt: SAMPLE_ID |
+| os_months     | Outcome   | numeric     | Overall survival time in months. Kept only if not missing and at least 0.   | data_clinical_patient.txt: OS_MONTHS |
+| os_event      | Outcome   | binary      | Overall survival event. 1 is deceased. 0 is living. Parsed from OS_STATUS.  | data_clinical_patient.txt: OS_STATUS |
+| age_at_dx     | Predictor | numeric     | Age at diagnosis in years. Converted to numeric.                            | data_clinical_patient.txt: AGE_AT_DIAGNOSIS |
+| sex           | Predictor | factor      | Sex after cleaning. Levels are Female and Male.                             | data_clinical_patient.txt: SEX |
+| npi           | Predictor | numeric     | Nottingham Prognostic Index value. Converted to numeric.                    | data_clinical_patient.txt: NPI |
+| nodes_pos     | Predictor | numeric     | Number of positive lymph nodes examined. Converted to numeric.              | data_clinical_patient.txt: LYMPH_NODES_EXAMINED_POSITIVE |
+| chemo         | Predictor | categorical | Chemotherapy label. Missing like tokens are set to NA earlier.              | data_clinical_patient.txt: CHEMOTHERAPY |
+| hormone_tx    | Predictor | categorical | Hormone therapy label. Missing like tokens are set to NA earlier.           | data_clinical_patient.txt: HORMONE_THERAPY |
+| radio_tx      | Predictor | categorical | Radiotherapy label. Missing like tokens are set to NA earlier.              | data_clinical_patient.txt: RADIO_THERAPY |
+| surgery       | Predictor | categorical | Breast surgery label. Missing like tokens are set to NA earlier.            | data_clinical_patient.txt: BREAST_SURGERY |
+| er_ihc        | Predictor | categorical | ER IHC result. Standardized to Positive or Negative when possible.          | data_clinical_patient.txt: ER_IHC |
+| her2_snp6     | Predictor | categorical | HER2 SNP6 call. Standardized to Amplified, Neutral, or Loss when possible.  | data_clinical_patient.txt: HER2_SNP6 |
+| intclust      | Predictor | categorical | Integrative cluster label as provided.                                      | data_clinical_patient.txt: INTCLUST |
+| claudin       | Predictor | categorical | Claudin subtype label as provided.                                          | data_clinical_patient.txt: CLAUDIN_SUBTYPE |
+| threegene     | Predictor | categorical | Three gene subtype label as provided.                                       | data_clinical_patient.txt: THREEGENE |
+| vital         | Predictor | categorical | Vital status text as provided.                                              | data_clinical_patient.txt: VITAL_STATUS |
+| sample_type   | Predictor | categorical | Sample type of the selected sample. Primary is preferred when available.    | data_clinical_sample.txt: SAMPLE_TYPE |
+| tumor_stage   | Predictor | categorical | Tumor stage from the sample table. Stored as text.                          | data_clinical_sample.txt: TUMOR_STAGE |
+| grade         | Predictor | categorical | Tumor grade from the sample table. Stored as text.                          | data_clinical_sample.txt: GRADE |
+| tumor_size    | Predictor | numeric     | Tumor size value. Converted to numeric.                                     | data_clinical_sample.txt: TUMOR_SIZE |
+| er_status     | Predictor | categorical | ER status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: ER_STATUS |
+| pr_status     | Predictor | categorical | PR status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: PR_STATUS |
+| her2_status   | Predictor | categorical | HER2 status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: HER2_STATUS |
+| tmb_nonsyn    | Predictor | numeric     | Tumor mutational burden value provided in the sample table. Converted to numeric. | data_clinical_sample.txt: TMB_NONSYNONYMOUS |
+
+
+```{r}
+xfun::session_info()
+```

@@ -1,0 +1,221 @@
+---
+title: "Clinical Base Model - cox"
+author: "Ching-Wen Mai"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+    date-format: iso
+    theme: materia
+    
+---
+
+
+
+# R Setup
+
+```{r}
+# =========================
+# (1) R Setup
+# =========================
+
+# Quarto option: hide package startup messages
+#| message: false
+
+# For reports and tables
+library(knitr)
+
+# Stats helper tools
+library(easystats)
+
+# Data wrangling tools
+library(tidyverse)
+
+```
+
+```{r}
+# =========================
+# (2) Import Master CSV
+# =========================
+
+base_dir   <- "C:/coding/R/datafest"
+output_dir <- file.path(base_dir, "output")
+out_clean_full <- file.path(output_dir, "clean_full")
+
+master_path <- file.path(out_clean_full, "clinical_master.csv")
+
+stopifnot(dir.exists(base_dir))
+stopifnot(file.exists(master_path))
+
+clinical_master <- readr::read_csv(master_path, show_col_types = FALSE)
+
+# Check required columns used later for splitting and Cox model
+need_cols <- c("patient_id", "sample_id", "os_months", "os_event")
+stopifnot(all(need_cols %in% names(clinical_master)))
+
+# Force column types to avoid strange types from csv import
+clinical_master <- clinical_master |>
+  mutate(
+    patient_id = as.character(patient_id),
+    sample_id  = as.character(sample_id),
+    os_months  = suppressWarnings(as.numeric(os_months)),
+    os_event   = suppressWarnings(as.integer(os_event))
+  )
+
+# Quick check summary
+list(
+  dim_master = dim(clinical_master),
+  os_event_tab = table(clinical_master$os_event, useNA = "ifany"),
+  os_months_bad = sum(is.na(clinical_master$os_months) | clinical_master$os_months < 0)
+)
+
+
+```
+
+
+
+
+# Train Test Split：切分訓練與測試
+```{r}
+# =========================
+# (3) Split patients into train and test
+# =========================
+
+# all variables = all clinical covariates in clinical_master
+# outcome and IDs excluded, and drop vital to avoid overlap with outcome
+
+drop_cols <- c("patient_id", "sample_id", "os_months", "os_event", "vital")
+clinical_pred_cols <- setdiff(names(clinical_master), drop_cols)
+
+analysis_master_clin <- clinical_master |>
+  select(patient_id, sample_id, os_months, os_event, all_of(clinical_pred_cols)) |>
+  filter(!is.na(os_months), os_months >= 0, !is.na(os_event)) |>
+  distinct(patient_id, .keep_all = TRUE)
+
+
+set.seed(431)
+
+train_ids_clin <- analysis_master_clin |>
+  distinct(patient_id, os_event) |>
+  group_by(os_event) |>
+  slice_sample(prop = 0.7) |>
+  ungroup() |>
+  pull(patient_id)
+
+df_train_clin <- analysis_master_clin |> filter(patient_id %in% train_ids_clin)
+df_test_clin  <- analysis_master_clin |> filter(!patient_id %in% train_ids_clin)
+
+stopifnot(nrow(df_train_clin) + nrow(df_test_clin) == nrow(analysis_master_clin))
+stopifnot(length(intersect(df_train_clin$patient_id, df_test_clin$patient_id)) == 0)
+stopifnot(length(intersect(df_train_clin$sample_id,  df_test_clin$sample_id))  == 0)
+
+list(train_dim = dim(df_train_clin), test_dim = dim(df_test_clin))
+
+
+
+
+```
+
+
+```{r}
+
+# =========================
+# (4) Cox model (clinical-only) + concordance C-index
+# =========================
+
+library(survival)
+
+# Copy data frames to avoid change in original data
+df_train_clin2 <- df_train_clin
+df_test_clin2  <- df_test_clin
+
+# Step 1 convert all character columns to factors and set NA to level Missing
+char_cols <- names(df_train_clin2)[vapply(df_train_clin2, is.character, logical(1))]
+
+df_train_clin2 <- df_train_clin2 |>
+  mutate(across(all_of(char_cols), ~ forcats::fct_na_value_to_level(factor(.x), level = "Missing")))
+
+df_test_clin2 <- df_test_clin2 |>
+  mutate(across(all_of(char_cols), ~ forcats::fct_na_value_to_level(factor(.x), level = "Missing")))
+
+
+# Step 2 match factor levels in test data to train data and avoid new level issue
+fac_cols <- names(df_train_clin2)[vapply(df_train_clin2, is.factor, logical(1))]
+for (cn in fac_cols) {
+  df_test_clin2[[cn]] <- factor(as.character(df_test_clin2[[cn]]),
+                                levels = levels(df_train_clin2[[cn]]))
+  # This line replaces earlier function fct_explicit_na with new helper
+  df_test_clin2[[cn]] <- forcats::fct_na_value_to_level(df_test_clin2[[cn]],
+                                                        level = "Missing")
+}
+
+# Step 2.5 drop rows with missing values only for numeric predictors
+# Missing values for factors are already stored as level Missing
+base_drop <- c("patient_id", "sample_id", "os_months", "os_event")
+pred_cols_all <- setdiff(names(df_train_clin2), base_drop)
+
+num_cols <- pred_cols_all[
+  vapply(df_train_clin2[pred_cols_all], \(x) is.numeric(x) || is.integer(x), logical(1))
+]
+
+train_before_n <- nrow(df_train_clin2)
+test_before_n  <- nrow(df_test_clin2)
+
+df_train_clin2 <- df_train_clin2 |>
+  tidyr::drop_na(all_of(num_cols))
+
+df_test_clin2 <- df_test_clin2 |>
+  tidyr::drop_na(all_of(num_cols))
+
+message("Train rows before: ", train_before_n, "  after: ", nrow(df_train_clin2))
+message("Test rows  before: ", test_before_n,  "  after: ", nrow(df_test_clin2))
+
+# Step 3 drop unused factor levels then find factors with one level to avoid NA in coefficients
+df_train_clin2 <- df_train_clin2 |>
+  mutate(across(where(is.factor), droplevels))
+
+df_test_clin2 <- df_test_clin2 |>
+  mutate(across(where(is.factor), droplevels))
+
+fac_cols2 <- names(df_train_clin2)[vapply(df_train_clin2, is.factor, logical(1))]
+nlev <- vapply(df_train_clin2[fac_cols2], nlevels, integer(1))
+drop_one_level <- names(nlev)[nlev < 2]
+
+if (length(drop_one_level) > 0) {
+  message("Dropping 1-level factors in training data: ", paste(drop_one_level, collapse = ", "))
+}
+
+# Step 4 build Cox formula with all clinical covariates chosen in section 6
+base_drop <- c("patient_id", "sample_id", "os_months", "os_event")
+pred_cols <- setdiff(names(df_train_clin2), c(base_drop, drop_one_level))
+
+cox_form <- as.formula(
+  paste("Surv(os_months, os_event) ~", paste(pred_cols, collapse = " + "))
+)
+
+# 5) Fit Cox
+cox_fit <- coxph(cox_form, data = df_train_clin2, ties = "efron")
+summary(cox_fit)
+
+# 6) Test concordance C-index
+df_test_scored <- df_test_clin2 |>
+  mutate(lp = predict(cox_fit, newdata = df_test_clin2, type = "lp"))
+
+c_index <- survival::concordance(
+  Surv(os_months, os_event) ~ lp,
+  data = df_test_scored,
+  reverse = TRUE
+)$concordance
+
+list(c_index = c_index)
+
+
+```
+
+
+```{r}
+xfun::session_info()
+```
+
