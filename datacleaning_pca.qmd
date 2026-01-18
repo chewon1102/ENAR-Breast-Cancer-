@@ -1,0 +1,1120 @@
+---
+title: "Breast Cancer Survival Prediction with Clinical and Multi Omics Data"
+author: "Ching-Wen, Mai"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+    date-format: iso
+    theme: materia
+    
+---
+
+
+
+# R Setup
+
+```{r}
+# =========================
+# (1) R Setup
+# =========================
+
+# Quarto option: hide package startup messages
+#| message: false
+
+library(knitr)
+library(easystats)
+library(tidyverse)
+library(forcats)
+library(here)
+
+
+```
+
+
+
+# Import Files
+```{r}
+# =========================
+# (2) Import Files
+# =========================
+
+# Project folders
+
+
+base_dir   <- here()
+input_dir  <- file.path(base_dir, "input")
+output_dir <- file.path(base_dir, "output")
+
+# Output subfolders
+out_clean_full   <- file.path(output_dir, "clean_full")
+out_clean_common <- file.path(output_dir, "clean_common")
+out_splits       <- file.path(output_dir, "splits")
+
+dir.create(out_clean_full,   showWarnings = FALSE, recursive = TRUE)
+dir.create(out_clean_common, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_splits,       showWarnings = FALSE, recursive = TRUE)
+
+# Read one tab-delimited file
+read_one <- function(x) {
+  f <- file.path(input_dir, x)                # Build full path
+  read.delim(
+    f,                                        # File path
+    sep = "\t",                               # Tab separated
+    header = TRUE,                            # First row is header
+    stringsAsFactors = FALSE,                 # Keep strings as character
+    comment.char = "#",                       # Ignore comment lines
+    quote = "",                               # No quote parsing
+    fill = TRUE,                              # Fill missing columns
+    check.names = FALSE                       # Keep original column names
+  )
+}
+
+# Read five raw tables
+patient_raw <- read_one("data_clinical_patient.txt")             # Patient-level clinical
+sample_raw  <- read_one("data_clinical_sample.txt")              # Sample-level clinical
+mrna_raw    <- read_one("data_mrna_illumina_microarray.txt")     # mRNA expression
+meth_raw    <- read_one("data_methylation_promoters_rrbs.txt")   # Methylation
+mut_raw     <- read_one("data_mutations.txt")                    # Mutations
+
+# Quick check: column names
+list(
+  patient_cols = names(patient_raw),                              # Patient columns
+  sample_cols  = names(sample_raw),                               # Sample columns
+  mrna_cols    = names(mrna_raw)[1:min(30, ncol(mrna_raw))],       # First 30 mRNA cols
+  meth_cols    = names(meth_raw)[1:min(30, ncol(meth_raw))],       # First 30 meth cols
+  mut_cols     = names(mut_raw)                                   # Mutation columns
+)
+
+# Quick check: table size
+list(
+  patient_dim = dim(patient_raw),                                 # (rows, cols)
+  sample_dim  = dim(sample_raw),
+  mrna_dim    = dim(mrna_raw),
+  meth_dim    = dim(meth_raw),
+  mut_dim     = dim(mut_raw)
+)
+
+# Peek key IDs and outcomes
+patient_raw |>
+  select(PATIENT_ID, AGE_AT_DIAGNOSIS, OS_MONTHS, OS_STATUS, VITAL_STATUS) |>
+  slice_head(n = 6)
+
+sample_raw |>
+  select(PATIENT_ID, SAMPLE_ID, SAMPLE_TYPE, TUMOR_STAGE, GRADE, TUMOR_SIZE, TMB_NONSYNONYMOUS) |>
+  slice_head(n = 6)
+
+# Omics are large: show only first few columns
+mrna_raw |> select(1:min(4, ncol(mrna_raw))) |> slice_head(n = 6)
+meth_raw |> select(1:min(4, ncol(meth_raw))) |> slice_head(n = 6)
+mut_raw  |> select(1:min(8, ncol(mut_raw)))  |> slice_head(n = 6)
+
+# Check common category values (find Unknown-like values)
+patient_raw |>
+  count(OS_STATUS, sort = TRUE) |>
+  slice_head(n = 15)
+
+sample_raw |>
+  count(TUMOR_STAGE, sort = TRUE) |>
+  slice_head(n = 15)
+
+
+
+```
+
+
+# Standardize Missing Tokens
+```{r}
+# =========================
+# (3) Standardize Missing Tokens
+# =========================
+
+# Common "missing" strings to convert into real NA
+missing_tokens <- c(
+  "", "NA", "N/A", "NULL",
+  "Not Available", "[Not Available]",
+  "Unknown", "[Unknown]"
+)
+
+# Replace missing tokens in character columns with NA
+standardize_missing <- function(df, tokens = missing_tokens) {
+  tok <- unique(tolower(tokens))                 # Normalize token list to lower-case
+
+  df |>
+    mutate(
+      across(
+        where(is.character),                     # Only character columns
+        \(v) {
+          v2 <- trimws(v)                        # Trim spaces
+          case_when(
+            is.na(v2) ~ NA_character_,           # Keep NA as NA
+            tolower(v2) %in% tok ~ NA_character_,# Token -> NA
+            TRUE ~ v2                            # Otherwise keep cleaned string
+          )
+        }
+      )
+    )
+}
+
+# -----------------------------
+# BEFORE vs AFTER token audit
+# -----------------------------
+
+# Count NA, empty strings, and token strings per character column
+token_audit <- function(df, tokens = missing_tokens) {
+  tok <- unique(tolower(tokens))                 # Normalize token list
+  char_cols <- names(df)[vapply(df, is.character, logical(1))]  # Character columns
+
+  tibble(col = char_cols) |>
+    mutate(
+      n_rows = nrow(df),                         # Total rows
+      n_na = vapply(char_cols, \(cn) sum(is.na(df[[cn]])), integer(1)),  # NA count
+      n_empty = vapply(char_cols, \(cn) {        # Empty string count
+        v <- df[[cn]]
+        sum(!is.na(v) & trimws(v) == "")
+      }, integer(1)),
+      n_token = vapply(char_cols, \(cn) {        # Token string count
+        v <- df[[cn]]
+        v2 <- trimws(v)
+        sum(!is.na(v2) & tolower(v2) %in% tok)
+      }, integer(1))
+    ) |>
+    arrange(desc(n_token), desc(n_empty), desc(n_na))  # Sort by most "bad" values
+}
+
+# Join BEFORE and AFTER audits, then compute deltas
+compare_audit <- function(before, after) {
+  before |>
+    select(
+      col, n_rows,
+      before_na = n_na, before_empty = n_empty, before_token = n_token
+    ) |>
+    left_join(
+      after |>
+        select(
+          col,
+          after_na = n_na, after_empty = n_empty, after_token = n_token
+        ),
+      by = "col"
+    ) |>
+    mutate(
+      delta_na = after_na - before_na,           # NA increase
+      delta_empty = after_empty - before_empty,  # Empty string change
+      delta_token = after_token - before_token   # Token count change
+    ) |>
+    arrange(delta_token, delta_empty, desc(delta_na))  # Tokens should drop to 0
+}
+
+# Keep BEFORE copies for auditing
+patient_raw_before <- patient_raw               # Patient table before cleaning
+sample_raw_before  <- sample_raw                # Sample table before cleaning
+mrna_raw_before    <- mrna_raw                  # mRNA table before cleaning
+meth_raw_before    <- meth_raw                  # Methylation table before cleaning
+mut_raw_before     <- mut_raw                   # Mutation table before cleaning
+
+# Apply standardization to each table
+patient_raw <- standardize_missing(patient_raw_before)  # Clean patient table
+sample_raw  <- standardize_missing(sample_raw_before)   # Clean sample table
+mrna_raw    <- standardize_missing(mrna_raw_before)     # Clean mRNA table
+meth_raw    <- standardize_missing(meth_raw_before)     # Clean methylation table
+mut_raw     <- standardize_missing(mut_raw_before)      # Clean mutation table
+
+# Audit: show top columns where empty/token existed (before or after)
+audit_patient <- compare_audit(
+  token_audit(patient_raw_before),
+  token_audit(patient_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)                            # Top 30 rows
+
+audit_sample <- compare_audit(
+  token_audit(sample_raw_before),
+  token_audit(sample_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_mrna <- compare_audit(
+  token_audit(mrna_raw_before),
+  token_audit(mrna_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_meth <- compare_audit(
+  token_audit(meth_raw_before),
+  token_audit(meth_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+audit_mut <- compare_audit(
+  token_audit(mut_raw_before),
+  token_audit(mut_raw)
+) |>
+  filter(before_empty > 0 | before_token > 0 | after_empty > 0 | after_token > 0) |>
+  slice_head(n = 30)
+
+# Return a quick summary list
+list(
+  patient_audit_top = audit_patient,            # Patient audit top rows
+  sample_audit_top  = audit_sample,             # Sample audit top rows
+  mrna_audit_top    = audit_mrna,               # mRNA audit top rows
+  meth_audit_top    = audit_meth,               # Methylation audit top rows
+  mut_audit_top     = audit_mut                 # Mutation audit top rows
+)
+
+
+```
+
+
+
+# Clean Clinical Data
+```{r}
+# =========================
+# (4) Clean Clinical Data
+# =========================
+
+# Convert OS_STATUS into 0/1/NA event indicator
+make_event <- function(x) {
+  # Make status comparable: character, trimmed, upper-case
+  x2 <- toupper(trimws(as.character(x)))
+  case_when(
+    # Missing stays missing
+    is.na(x2) ~ NA_integer_,
+    # Common numeric prefix encodings
+    str_detect(x2, "^1") ~ 1L,
+    str_detect(x2, "^0") ~ 0L,
+    # Common text encodings
+    str_detect(x2, "DECEASED|DEAD") ~ 1L,
+    str_detect(x2, "LIVING|ALIVE") ~ 0L,
+    # Anything else becomes NA
+    TRUE ~ NA_integer_
+  )
+}
+
+# Convert numeric with audit
+to_num_audit <- function(x, label) {
+  x0 <- trimws(as.character(x))
+  y  <- suppressWarnings(as.numeric(x0))
+
+  n_failed <- sum(!is.na(x0) & x0 != "" & is.na(y))
+
+  if (n_failed > 0) {
+  warning(label, ": numeric conversion failed for ", n_failed, " values", call. = FALSE)
+}
+
+  y
+}
+
+# Patient-level cleaning
+patient_cln <- patient_raw |>
+  transmute(
+    patient_id = as.character(PATIENT_ID),                        # Patient key
+    age_at_dx  = to_num_audit(AGE_AT_DIAGNOSIS, "AGE_AT_DIAGNOSIS"),   # Age at diagnosis
+    sex        = as.character(SEX),                                # Sex
+    npi        = to_num_audit(NPI, "NPI"),                # NPI score
+    nodes_pos  = to_num_audit(LYMPH_NODES_EXAMINED_POSITIVE, "LYMPH_NODES_EXAMINED_POSITIVE"), # Positive nodes
+    chemo      = as.character(CHEMOTHERAPY),                       # Chemo label
+    hormone_tx = as.character(HORMONE_THERAPY),                    # Hormone therapy label
+    radio_tx   = as.character(RADIO_THERAPY),                      # Radiotherapy label
+    surgery    = as.character(BREAST_SURGERY),                     # Surgery label
+    er_ihc     = as.character(ER_IHC),                             # ER IHC label
+    her2_snp6  = as.character(HER2_SNP6),                          # HER2 SNP6 label
+    intclust   = as.character(INTCLUST),                           # Integrative cluster
+    claudin    = as.character(CLAUDIN_SUBTYPE),                    # Claudin subtype
+    threegene  = as.character(THREEGENE),                          # Three-gene subtype
+    os_months  = to_num_audit(OS_MONTHS, "OS_MONTHS"),          # OS time in months
+    os_event   = make_event(OS_STATUS),                            # OS event
+  ) |>
+  filter(!is.na(patient_id)) |>
+  filter(!is.na(os_months), os_months >= 0) |>
+  filter(!is.na(os_event)) |>
+  mutate(
+    # Standardize sex values
+    sex = case_when(
+      toupper(trimws(sex)) %in% c("F", "FEMALE") ~ "Female",
+      toupper(trimws(sex)) %in% c("M", "MALE") ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    # Store sex as categorical
+    sex = factor(sex),
+    # Standardize ER IHC to Positive/Negative when possible
+    er_ihc = case_when(
+      str_detect(toupper(er_ihc), "POSIT") ~ "Positive",
+      str_detect(toupper(er_ihc), "NEGAT") ~ "Negative",
+      TRUE ~ er_ihc
+    ),
+    # Standardize HER2 SNP6 categories when possible
+    her2_snp6 = case_when(
+      str_detect(toupper(her2_snp6), "AMPL") ~ "Amplified",
+      str_detect(toupper(her2_snp6), "NEUT") ~ "Neutral",
+      str_detect(toupper(her2_snp6), "LOSS|DEL") ~ "Loss",
+      TRUE ~ her2_snp6
+    )
+  )
+
+# Sample-level cleaning
+sample_cln <- sample_raw |>
+  transmute(
+    patient_id  = as.character(PATIENT_ID),                        # Patient key
+    sample_id   = as.character(SAMPLE_ID),                         # Sample key
+    sample_type = as.character(SAMPLE_TYPE),                       # Sample type text
+    tumor_stage = as.character(TUMOR_STAGE),                       # Stage text
+    grade       = as.character(GRADE),                             # Grade text
+    tumor_size  = to_num_audit(TUMOR_SIZE, "TUMOR_SIZE"),         # Tumor size
+    er_status   = as.character(ER_STATUS),                         # ER status text
+    pr_status   = as.character(PR_STATUS),                         # PR status text
+    her2_status = as.character(HER2_STATUS),                       # HER2 status text
+    tmb_nonsyn  = to_num_audit(TMB_NONSYNONYMOUS, "TMB_NONSYNONYMOUS")   # TMB value
+  ) |>
+  filter(!is.na(patient_id), !is.na(sample_id)) |>
+  mutate(
+    # Standardize ER status to Positive/Negative when possible
+    er_status = case_when(
+      str_detect(toupper(er_status), "POSIT") ~ "Positive",
+      str_detect(toupper(er_status), "NEGAT") ~ "Negative",
+      TRUE ~ er_status
+    ),
+    # Standardize PR status to Positive/Negative when possible
+    pr_status = case_when(
+      str_detect(toupper(pr_status), "POSIT") ~ "Positive",
+      str_detect(toupper(pr_status), "NEGAT") ~ "Negative",
+      TRUE ~ pr_status
+    ),
+    # Standardize HER2 status to Positive/Negative when possible
+    her2_status = case_when(
+      str_detect(toupper(her2_status), "POSIT") ~ "Positive",
+      str_detect(toupper(her2_status), "NEGAT") ~ "Negative",
+      TRUE ~ her2_status
+    )
+  )
+
+# Keep one sample per patient, prefer Primary
+sample_one <- sample_cln |>
+  mutate(is_primary = str_detect(tolower(sample_type), "primary")) |>
+  arrange(patient_id, desc(is_primary), sample_id) |>
+  group_by(patient_id) |>
+  slice(1) |>
+  ungroup() |>
+  select(-is_primary)
+
+# Build master clinical table
+clinical_master <- patient_cln |>
+  inner_join(sample_one, by = "patient_id") |>
+  distinct(patient_id, .keep_all = TRUE)
+
+# Check final dimension
+dim(clinical_master)
+
+# CSV
+write_csv(
+  clinical_master,
+  file.path(out_clean_full, "clinical_master.csv")
+)
+
+```
+
+
+
+## Codebook for clinical_master
+
+| Variable      | Role      | Type        | Description                                                                 | Source |
+|---|---|---|---|---|
+| patient_id    | ID        | string      | Patient identifier used for merges. One sample is kept per patient.         | data_clinical_patient.txt: PATIENT_ID |
+| sample_id     | ID        | string      | Sample identifier for the selected sample per patient.                      | data_clinical_sample.txt: SAMPLE_ID |
+| os_months     | Outcome   | numeric     | Overall survival time in months. Kept only if not missing and at least 0.   | data_clinical_patient.txt: OS_MONTHS |
+| os_event      | Outcome   | binary      | Overall survival event. 1 is deceased. 0 is living. Parsed from OS_STATUS.  | data_clinical_patient.txt: OS_STATUS |
+| age_at_dx     | Predictor | numeric     | Age at diagnosis in years. Converted to numeric.                            | data_clinical_patient.txt: AGE_AT_DIAGNOSIS |
+| sex           | Predictor | factor      | Sex after cleaning. Levels are Female and Male.                             | data_clinical_patient.txt: SEX |
+| npi           | Predictor | numeric     | Nottingham Prognostic Index value. Converted to numeric.                    | data_clinical_patient.txt: NPI |
+| nodes_pos     | Predictor | numeric     | Number of positive lymph nodes examined. Converted to numeric.              | data_clinical_patient.txt: LYMPH_NODES_EXAMINED_POSITIVE |
+| chemo         | Predictor | categorical | Chemotherapy label. Missing like tokens are set to NA earlier.              | data_clinical_patient.txt: CHEMOTHERAPY |
+| hormone_tx    | Predictor | categorical | Hormone therapy label. Missing like tokens are set to NA earlier.           | data_clinical_patient.txt: HORMONE_THERAPY |
+| radio_tx      | Predictor | categorical | Radiotherapy label. Missing like tokens are set to NA earlier.              | data_clinical_patient.txt: RADIO_THERAPY |
+| surgery       | Predictor | categorical | Breast surgery label. Missing like tokens are set to NA earlier.            | data_clinical_patient.txt: BREAST_SURGERY |
+| er_ihc        | Predictor | categorical | ER IHC result. Standardized to Positive or Negative when possible.          | data_clinical_patient.txt: ER_IHC |
+| her2_snp6     | Predictor | categorical | HER2 SNP6 call. Standardized to Amplified, Neutral, or Loss when possible.  | data_clinical_patient.txt: HER2_SNP6 |
+| intclust      | Predictor | categorical | Integrative cluster label as provided.                                      | data_clinical_patient.txt: INTCLUST |
+| claudin       | Predictor | categorical | Claudin subtype label as provided.                                          | data_clinical_patient.txt: CLAUDIN_SUBTYPE |
+| threegene     | Predictor | categorical | Three gene subtype label as provided.                                       | data_clinical_patient.txt: THREEGENE |
+| sample_type   | Predictor | categorical | Sample type of the selected sample. Primary is preferred when available.    | data_clinical_sample.txt: SAMPLE_TYPE |
+| tumor_stage   | Predictor | categorical | Tumor stage from the sample table. Stored as text.                          | data_clinical_sample.txt: TUMOR_STAGE |
+| grade         | Predictor | categorical | Tumor grade from the sample table. Stored as text.                          | data_clinical_sample.txt: GRADE |
+| tumor_size    | Predictor | numeric     | Tumor size value. Converted to numeric.                                     | data_clinical_sample.txt: TUMOR_SIZE |
+| er_status     | Predictor | categorical | ER status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: ER_STATUS |
+| pr_status     | Predictor | categorical | PR status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: PR_STATUS |
+| her2_status   | Predictor | categorical | HER2 status from the sample table. Standardized to Positive or Negative when possible. | data_clinical_sample.txt: HER2_STATUS |
+| tmb_nonsyn    | Predictor | numeric     | Tumor mutational burden value provided in the sample table. Converted to numeric. | data_clinical_sample.txt: TMB_NONSYNONYMOUS |
+
+# Train Test Split
+```{r}
+# =========================
+# (5) Split patients into train and test
+# =========================
+
+
+mrna_samples_in_file <- setdiff(names(mrna_raw), c("Hugo_Symbol", "Entrez_Gene_Id"))
+meth_samples_in_file <- setdiff(names(meth_raw), c("Hugo_Symbol", "Entrez_Gene_Id"))
+
+analysis_master <- clinical_master |>
+  filter(
+    sample_id %in% mrna_samples_in_file,
+    sample_id %in% meth_samples_in_file
+  ) |>
+  filter(!is.na(os_months), !is.na(os_event))
+
+
+clinical_num_cols <- c("age_at_dx", "npi", "nodes_pos")
+analysis_master <- analysis_master |>
+  filter(complete.cases(across(all_of(clinical_num_cols))))
+
+set.seed(123)
+
+idx_train <- analysis_master |>
+  mutate(row_id = row_number()) |>
+  group_by(os_event) |>
+  slice_sample(prop = 0.8) |>
+  pull(row_id) |>
+  sort()
+
+
+
+saveRDS(idx_train, file.path(out_splits, "idx_train.rds"))
+
+train_ids <- analysis_master[idx_train, c("patient_id", "sample_id")]
+test_ids  <- analysis_master[-idx_train, c("patient_id", "sample_id")]
+
+write_csv(train_ids, file.path(out_splits, "train_ids.csv"))
+write_csv(test_ids,  file.path(out_splits, "test_ids.csv"))
+
+clinical_train_common <- analysis_master[idx_train, , drop = FALSE]
+clinical_test_common  <- analysis_master[-idx_train, , drop = FALSE]
+
+stopifnot(nrow(clinical_train_common) + nrow(clinical_test_common) == nrow(analysis_master))
+stopifnot(length(intersect(clinical_train_common$patient_id, clinical_test_common$patient_id)) == 0)
+stopifnot(length(intersect(clinical_train_common$sample_id,  clinical_test_common$sample_id))  == 0)
+
+
+```
+
+
+# Omics Matrix Builder
+```{r}
+
+# =========================
+# (6) Omics Matrix Builder
+# =========================
+
+
+make_omics_mats <- function(omics_raw,
+                            sample_ids,
+                            train_sample_ids,
+                            gene_col = "Hugo_Symbol",
+                            max_missing_frac = 0.2,
+                            top_n_var = 2000) {
+
+  stopifnot(gene_col %in% names(omics_raw))
+
+  omics0 <- omics_raw |>
+    mutate(
+      gene = as.character(.data[[gene_col]]),
+      gene = if_else(is.na(gene) | gene == "", NA_character_, gene)
+    ) |>
+    filter(!is.na(gene))
+
+  keep_samples <- intersect(sample_ids, names(omics0))
+
+  omics1 <- omics0 |>
+    select(gene, any_of(keep_samples)) |>
+    mutate(
+      across(-gene, ~ suppressWarnings(as.numeric(.x)))
+    )
+
+  genes <- omics1$gene
+  mat0 <- as.matrix(omics1[, -1, drop = FALSE])
+  rownames(mat0) <- genes
+
+  if (anyDuplicated(genes)) {
+    sum_mat <- rowsum(replace(mat0, is.na(mat0), 0), group = genes, reorder = FALSE)
+    cnt_mat <- rowsum((!is.na(mat0)) * 1, group = genes, reorder = FALSE)
+
+    mat <- sum_mat / cnt_mat
+    mat[cnt_mat == 0] <- NA_real_
+  } else {
+    mat <- mat0
+  }
+
+  mat_sg <- t(mat)
+
+  train_rows <- rownames(mat_sg) %in% train_sample_ids
+  mat_train <- mat_sg[train_rows, , drop = FALSE]
+
+  miss_frac <- colMeans(is.na(mat_train))
+  keep_genes <- names(miss_frac)[miss_frac <= max_missing_frac]
+
+  mat_sg <- mat_sg[, keep_genes, drop = FALSE]
+  mat_train <- mat_train[, keep_genes, drop = FALSE]
+
+  vars <- apply(mat_train, 2, var, na.rm = TRUE)
+  vars <- vars[is.finite(vars) & vars > 0]
+  vars <- sort(vars, decreasing = TRUE)
+
+  keep_top <- names(vars)[seq_len(min(top_n_var, length(vars)))]
+  mat_sg <- mat_sg[, keep_top, drop = FALSE]
+
+  if (ncol(mat_sg) < 200) stop("Too few genes after filtering.")
+
+  list(
+    mat = mat_sg,
+    samples = rownames(mat_sg),
+    genes = colnames(mat_sg)
+  )
+
+}
+
+
+
+train_sample_ids_common <- clinical_train_common$sample_id
+test_sample_ids_common  <- clinical_test_common$sample_id
+all_sample_ids_common   <- c(train_sample_ids_common, test_sample_ids_common)
+
+
+fill_mut_features <- function(df, mut_ids) {
+  mut_cols <- c(
+    "tmb_nonsyn",
+    "mut_n_total", "mut_n_nonsyn", "mut_gene_n_nonsyn",
+    grep("^mut_", names(df), value = TRUE)
+  )
+  mut_cols <- unique(intersect(mut_cols, names(df)))
+
+  df |>
+    mutate(
+      mut_profile_available = (sample_id %in% mut_ids) | !is.na(tmb_nonsyn)
+    ) |>
+    mutate(
+      across(all_of(mut_cols), \(x) if_else(is.na(x), 0, x))
+    )
+}
+
+
+
+```
+
+
+# mRNA PCA Features
+```{r}
+# =========================
+# (7) mRNA PCA Features
+# =========================
+
+
+# Impute with train medians. Fit PCA on train. Project to test.
+mrna_obj <- make_omics_mats(
+  omics_raw = mrna_raw,
+  sample_ids = all_sample_ids_common,
+  train_sample_ids = train_sample_ids_common,
+  gene_col = "Hugo_Symbol",
+  max_missing_frac = 0.2,
+  top_n_var = 2000
+)
+
+mrna_mat <- mrna_obj$mat
+mrna_train_mat <- mrna_mat[rownames(mrna_mat) %in% train_sample_ids_common, , drop = FALSE]
+mrna_test_mat  <- mrna_mat[rownames(mrna_mat) %in% test_sample_ids_common,  , drop = FALSE]
+
+
+# Impute missing using training medians
+mrna_train_meds <- apply(mrna_train_mat, 2, function(v) median(v, na.rm = TRUE))
+for (j in seq_len(ncol(mrna_train_mat))) {
+  idx <- is.na(mrna_train_mat[, j])
+  if (any(idx)) mrna_train_mat[idx, j] <- mrna_train_meds[j]
+}
+for (j in seq_len(ncol(mrna_test_mat))) {
+  idx <- is.na(mrna_test_mat[, j])
+  if (any(idx)) mrna_test_mat[idx, j] <- mrna_train_meds[j]
+}
+
+# PCA
+mrna_pca_fit <- prcomp(mrna_train_mat, center = TRUE, scale. = TRUE)
+
+k_mrna <- 10
+k_mrna <- min(k_mrna, ncol(mrna_pca_fit$x))
+
+mrna_train_scores <- as_tibble(mrna_pca_fit$x[, seq_len(k_mrna), drop = FALSE], .name_repair = "minimal") |>
+  mutate(sample_id = rownames(mrna_pca_fit$x)) |>
+  relocate(sample_id)
+
+mrna_test_scores <- as_tibble(predict(mrna_pca_fit, newdata = mrna_test_mat)[, seq_len(k_mrna), drop = FALSE],
+                              .name_repair = "minimal") |>
+  mutate(sample_id = rownames(mrna_test_mat)) |>
+  relocate(sample_id)
+
+
+dim(mrna_train_scores)
+dim(mrna_test_scores)
+
+
+```
+
+
+# Methylation PCA Features
+```{r}
+# =========================
+# (8) Methylation PCA Features
+# =========================
+meth_obj <- make_omics_mats(
+  omics_raw = meth_raw,
+  sample_ids = all_sample_ids_common,
+  train_sample_ids = train_sample_ids_common,
+  gene_col = "Hugo_Symbol",
+  max_missing_frac = 0.2,
+  top_n_var = 2000
+)
+
+meth_mat <- meth_obj$mat
+meth_train_mat <- meth_mat[rownames(meth_mat) %in% train_sample_ids_common, , drop = FALSE]
+meth_test_mat  <- meth_mat[rownames(meth_mat) %in% test_sample_ids_common,  , drop = FALSE]
+
+
+meth_train_meds <- apply(meth_train_mat, 2, function(v) median(v, na.rm = TRUE))
+for (j in seq_len(ncol(meth_train_mat))) {
+  idx <- is.na(meth_train_mat[, j])
+  if (any(idx)) meth_train_mat[idx, j] <- meth_train_meds[j]
+}
+for (j in seq_len(ncol(meth_test_mat))) {
+  idx <- is.na(meth_test_mat[, j])
+  if (any(idx)) meth_test_mat[idx, j] <- meth_train_meds[j]
+}
+
+meth_pca_fit <- prcomp(meth_train_mat, center = TRUE, scale. = TRUE)
+
+k_meth <- 10
+k_meth <- min(k_meth, ncol(meth_pca_fit$x))
+
+meth_train_scores <- as_tibble(meth_pca_fit$x[, seq_len(k_meth), drop = FALSE], .name_repair = "minimal") |>
+  mutate(sample_id = rownames(meth_pca_fit$x)) |>
+  relocate(sample_id)
+
+meth_test_scores <- as_tibble(predict(meth_pca_fit, newdata = meth_test_mat)[, seq_len(k_meth), drop = FALSE],
+                              .name_repair = "minimal") |>
+  mutate(sample_id = rownames(meth_test_mat)) |>
+  relocate(sample_id)
+
+
+dim(meth_train_scores)
+dim(meth_test_scores)
+
+```
+
+
+# Rename PC Columns
+```{r}
+# =========================
+# (9) Add prefixes to PC names.
+# =========================
+
+
+mrna_train_scores2 <- mrna_train_scores |>
+  rename_with(~ paste0("mrna_", .x), starts_with("PC"))
+
+mrna_test_scores2 <- mrna_test_scores |>
+  rename_with(~ paste0("mrna_", .x), starts_with("PC"))
+
+meth_train_scores2 <- meth_train_scores |>
+  rename_with(~ paste0("meth_", .x), starts_with("PC"))
+
+meth_test_scores2 <- meth_test_scores |>
+  rename_with(~ paste0("meth_", .x), starts_with("PC"))
+```
+
+
+
+# Mutation Burden Feature
+```{r}
+
+# =========================
+# (10) Mutation Burden Feature
+# =========================
+
+
+# Check mutation barcode match and build mutation features from mutation file
+
+mut_long <- mut_raw |>
+  transmute(
+    sample_id  = as.character(Tumor_Sample_Barcode),
+    gene       = as.character(Hugo_Symbol),
+    var_class  = as.character(Variant_Classification)
+  ) |>
+  mutate(
+    sample_id = trimws(sample_id),
+    gene = toupper(trimws(gene)),
+    var_class = toupper(trimws(var_class))
+  ) |>
+  filter(!is.na(sample_id), sample_id != "")
+
+
+# 11 Mutation overlap summary
+mut_ids <- mut_long |>
+  distinct(sample_id) |>
+  pull(sample_id)
+
+sam_ids <- clinical_master |>
+  distinct(sample_id) |>
+  pull(sample_id)
+
+mut_overlap_summary <- tibble(
+  n_clinical = length(sam_ids),
+  n_mut_file = length(mut_ids),
+  n_overlap  = length(intersect(sam_ids, mut_ids)),
+  n_clinical_not_in_mut = length(setdiff(sam_ids, mut_ids)),
+  n_mut_not_in_clinical = length(setdiff(mut_ids, sam_ids))
+  
+)
+
+mut_overlap_summary
+# Quick examples to inspect ID format mismatches
+setdiff(head(mut_ids, 50), sam_ids)
+setdiff(head(sam_ids, 50), mut_ids)
+
+
+# mutation features 
+build_mut_features <- function(mut_long, train_ids, test_ids, top_n = 20) {
+
+  mut_summary <- mut_long |>
+    group_by(sample_id) |>
+    summarise(
+      mut_n_total = n(),
+      mut_n_nonsyn = sum(!is.na(var_class) & var_class != "SILENT", na.rm = TRUE),
+      mut_gene_n_nonsyn = n_distinct(gene[!is.na(var_class) & var_class != "SILENT"]),
+      .groups = "drop"
+    )
+
+  top_genes <- mut_long |>
+    filter(
+      sample_id %in% train_ids,
+      !is.na(var_class),
+      var_class != "SILENT",
+      !is.na(gene),
+      gene != ""
+    ) |>
+    distinct(sample_id, gene) |>
+    count(gene, sort = TRUE) |>
+    slice_head(n = top_n) |>
+    pull(gene)
+
+  mut_gene_ind <- mut_long |>
+    filter(!is.na(var_class), var_class != "SILENT", gene %in% top_genes) |>
+    distinct(sample_id, gene) |>
+    mutate(value = 1L) |>
+    pivot_wider(
+      names_from = gene,
+      values_from = value,
+      values_fill = 0L,
+      names_prefix = "mut_"
+    )
+
+  mut_feat <- mut_summary |>
+    left_join(mut_gene_ind, by = "sample_id")
+
+  list(
+    mut_feat_train = mut_feat |> filter(sample_id %in% train_ids),
+    mut_feat_test  = mut_feat |> filter(sample_id %in% test_ids),
+    top_genes      = top_genes
+  )
+}
+
+
+mut_obj_common <- build_mut_features(
+  mut_long = mut_long,
+  train_ids = train_sample_ids_common,
+  test_ids  = test_sample_ids_common,
+  top_n = 20
+)
+
+mut_feat_train_common <- mut_obj_common$mut_feat_train
+mut_feat_test_common  <- mut_obj_common$mut_feat_test
+
+
+# quick check
+
+dim(mut_feat_train_common)
+dim(mut_feat_test_common)
+
+
+```
+
+
+# Build Model Datasets
+```{r}
+
+# =========================
+# (11) Build Model Datasets
+# =========================
+lock_cat_levels <- function(train_df, test_df,
+                            exclude = c("patient_id", "sample_id", "os_months", "os_event")) {
+  cols <- intersect(names(train_df), names(test_df))
+  cols <- setdiff(cols, exclude)
+
+  for (cn in cols) {
+    is_cat <- is.character(train_df[[cn]]) || is.factor(train_df[[cn]]) ||
+      is.character(test_df[[cn]]) || is.factor(test_df[[cn]])
+
+    if (!is_cat) next
+
+    tr <- trimws(as.character(train_df[[cn]]))
+    te <- trimws(as.character(test_df[[cn]]))
+
+    tr[is.na(tr) | tr == ""] <- "Missing"
+    te[is.na(te) | te == ""] <- "Missing"
+
+    lv <- sort(unique(tr))
+    if (!("Missing" %in% lv)) lv <- c(lv, "Missing")
+
+    te[!te %in% lv] <- "Missing"
+
+    train_df[[cn]] <- factor(tr, levels = lv)
+    test_df[[cn]]  <- factor(te, levels = lv)
+  }
+
+  list(train = train_df, test = test_df)
+}
+
+# 12a
+fill_cat_missing <- function(df, exclude = c("patient_id", "sample_id")) {
+  cols <- setdiff(names(df), exclude)
+
+  char_cols <- cols[vapply(df[cols], is.character, logical(1))]
+  fac_cols  <- cols[vapply(df[cols], is.factor, logical(1))]
+
+  df |>
+    mutate(
+      across(
+        all_of(char_cols),
+        \(x) if_else(is.na(x) | trimws(x) == "", "Missing", x)
+      ),
+      across(
+        all_of(fac_cols),
+        \(x) forcats::fct_na_value_to_level(x, level = "Missing")
+      )
+    )
+}
+# 
+df_train_clinical_common <- clinical_train_common |>
+  select(
+    patient_id, sample_id, os_months, os_event,
+    age_at_dx, sex, npi, nodes_pos,
+    tumor_stage, grade, er_status, pr_status, her2_status,
+    chemo, hormone_tx, radio_tx, surgery
+  ) |>
+  fill_cat_missing()
+
+df_test_clinical_common <- clinical_test_common |>
+  select(
+    patient_id, sample_id, os_months, os_event,
+    age_at_dx, sex, npi, nodes_pos,
+    tumor_stage, grade, er_status, pr_status, her2_status,
+    chemo, hormone_tx, radio_tx, surgery
+  ) |>
+  fill_cat_missing()
+
+df_train_mrna_common <- df_train_clinical_common |>
+  left_join(mrna_train_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+df_test_mrna_common <- df_test_clinical_common |>
+  left_join(mrna_test_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+df_train_meth_common <- df_train_clinical_common |>
+  left_join(meth_train_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+df_test_meth_common <- df_test_clinical_common |>
+  left_join(meth_test_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+tmb_train_common <- clinical_train_common |> transmute(sample_id, tmb_nonsyn)
+tmb_test_common  <- clinical_test_common  |> transmute(sample_id, tmb_nonsyn)
+
+df_train_mut_common <- df_train_clinical_common |>
+  left_join(tmb_train_common, by = "sample_id") |>
+  left_join(mut_feat_train_common, by = "sample_id") |>
+  fill_mut_features(mut_ids) |>
+  fill_cat_missing()
+
+df_test_mut_common <- df_test_clinical_common |>
+  left_join(tmb_test_common, by = "sample_id") |>
+  left_join(mut_feat_test_common, by = "sample_id") |>
+  fill_mut_features(mut_ids) |>
+  fill_cat_missing()
+
+df_train_all_common <- df_train_mut_common |>
+  left_join(mrna_train_scores2, by = "sample_id") |>
+  left_join(meth_train_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+df_test_all_common <- df_test_mut_common |>
+  left_join(mrna_test_scores2, by = "sample_id") |>
+  left_join(meth_test_scores2, by = "sample_id") |>
+  fill_cat_missing()
+
+tmp <- lock_cat_levels(df_train_clinical_common, df_test_clinical_common)
+df_train_clinical_common <- tmp$train
+df_test_clinical_common  <- tmp$test
+
+tmp <- lock_cat_levels(df_train_mrna_common, df_test_mrna_common)
+df_train_mrna_common <- tmp$train
+df_test_mrna_common  <- tmp$test
+
+tmp <- lock_cat_levels(df_train_meth_common, df_test_meth_common)
+df_train_meth_common <- tmp$train
+df_test_meth_common  <- tmp$test
+
+tmp <- lock_cat_levels(df_train_mut_common, df_test_mut_common)
+df_train_mut_common <- tmp$train
+df_test_mut_common  <- tmp$test
+
+tmp <- lock_cat_levels(df_train_all_common, df_test_all_common)
+df_train_all_common <- tmp$train
+df_test_all_common  <- tmp$test
+
+```
+
+
+
+
+# Validation Checks
+```{r}
+
+# =========================
+# (12) Validation Checks
+# =========================
+check_missing_outcome <- function(df) {
+tibble(
+n = nrow(df),
+missing_time = sum(is.na(df$os_months)),
+missing_event = sum(is.na(df$os_event))
+)
+}
+
+bind_rows(
+clinical = check_missing_outcome(df_train_clinical_common),
+mrna     = check_missing_outcome(df_train_mrna_common),
+meth     = check_missing_outcome(df_train_meth_common),
+mut      = check_missing_outcome(df_train_mut_common),
+all      = check_missing_outcome(df_train_all_common),
+.id = "dataset"
+)
+
+# Check how many samples did not get PCA scores after join
+
+count_rows_missing_pc <- function(df, pattern) {
+pc_cols <- grep(pattern, names(df), value = TRUE)
+if (length(pc_cols) == 0) return(NA_integer_)
+sum(!complete.cases(df[, pc_cols, drop = FALSE]))
+}
+
+tibble(
+missing_mrna_pc_rows = count_rows_missing_pc(df_train_mrna_common, "^mrna_PC"),
+missing_meth_pc_rows = count_rows_missing_pc(df_train_meth_common, "^meth_PC"),
+missing_all_pc_rows  = sum(!complete.cases(df_train_all_common[, c(
+grep("^mrna_PC", names(df_train_all_common), value = TRUE),
+grep("^meth_PC", names(df_train_all_common), value = TRUE)
+), drop = FALSE]))
+)
+
+pc_cols_mrna <- grep("^mrna_PC", names(df_train_mrna_common), value = TRUE)
+pc_cols_meth <- grep("^meth_PC", names(df_train_meth_common), value = TRUE)
+
+stopifnot(all(complete.cases(df_train_mrna_common[, pc_cols_mrna, drop = FALSE])))
+stopifnot(all(complete.cases(df_test_mrna_common[,  pc_cols_mrna, drop = FALSE])))
+
+stopifnot(all(complete.cases(df_train_meth_common[, pc_cols_meth, drop = FALSE])))
+stopifnot(all(complete.cases(df_test_meth_common[,  pc_cols_meth, drop = FALSE])))
+
+pc_cols_all <- c(pc_cols_mrna, pc_cols_meth)
+stopifnot(all(complete.cases(df_train_all_common[, pc_cols_all, drop = FALSE])))
+stopifnot(all(complete.cases(df_test_all_common[,  pc_cols_all, drop = FALSE])))
+
+# 13b Event count check after filtering
+
+count_events <- function(df) sum(df$os_event == 1L, na.rm = TRUE)
+
+event_check_both <- tibble(
+  dataset = c("clinical", "mrna", "meth", "mut", "all"),
+  train_n = c(
+    nrow(df_train_clinical_common),
+    nrow(df_train_mrna_common),
+    nrow(df_train_meth_common),
+    nrow(df_train_mut_common),
+    nrow(df_train_all_common)
+  ),
+  train_events = c(
+    count_events(df_train_clinical_common),
+    count_events(df_train_mrna_common),
+    count_events(df_train_meth_common),
+    count_events(df_train_mut_common),
+    count_events(df_train_all_common)
+  ),
+  test_n = c(
+    nrow(df_test_clinical_common),
+    nrow(df_test_mrna_common),
+    nrow(df_test_meth_common),
+    nrow(df_test_mut_common),
+    nrow(df_test_all_common)
+  ),
+  test_events = c(
+    count_events(df_test_clinical_common),
+    count_events(df_test_mrna_common),
+    count_events(df_test_meth_common),
+    count_events(df_test_mut_common),
+    count_events(df_test_all_common)
+  )
+)
+
+event_check_both
+
+stopifnot(all(event_check_both$train_events > 0))
+stopifnot(all(event_check_both$test_events > 0))
+
+
+
+```
+
+
+# Save Clean Outputs
+```{r}
+
+# =========================
+# (13) Save Clean Outputs
+# =========================
+
+
+
+
+write_csv(df_train_clinical_common, file.path(out_clean_common, "train_clinical.csv"))
+write_csv(df_test_clinical_common,  file.path(out_clean_common, "test_clinical.csv"))
+
+write_csv(df_train_mrna_common, file.path(out_clean_common, "train_mrna.csv"))
+write_csv(df_test_mrna_common,  file.path(out_clean_common, "test_mrna.csv"))
+
+write_csv(df_train_meth_common, file.path(out_clean_common, "train_meth.csv"))
+write_csv(df_test_meth_common,  file.path(out_clean_common, "test_meth.csv"))
+
+write_csv(df_train_mut_common, file.path(out_clean_common, "train_mut.csv"))
+write_csv(df_test_mut_common,  file.path(out_clean_common, "test_mut.csv"))
+
+write_csv(df_train_all_common, file.path(out_clean_common, "train_all_omics.csv"))
+write_csv(df_test_all_common,  file.path(out_clean_common, "test_all_omics.csv"))
+
+
+
+```
+
+
+```{r}
+xfun::session_info()
+```
