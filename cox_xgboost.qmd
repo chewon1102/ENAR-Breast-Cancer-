@@ -1,0 +1,270 @@
+---
+title: "Modelling - Cox-XGBOOST"
+format: html
+author: "Chaewon Oh"
+---
+### 1. Load packages and create directories
+```{r}
+library(xgboost)
+library(dplyr)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+
+Sys.setenv(LANGUAGE = "en")
+base_dir <- "C:/Users/USER/OneDrive/바탕 화면/Projects - R & Python/R Projects/ENAR"
+setwd(base_dir)
+omics_dir <- file.path(base_dir, "output_w_omics", "clean_common")
+dir.create("single_models", showWarnings = FALSE)
+dir.create("single_predictions", showWarnings = FALSE)
+
+```
+
+### 2. Create Function to fit XGB Cox 
+```{r}
+run_xgb <- function(train_csv, test_csv, tag) {
+  # use print to fix the error 
+  train_df <- read_csv(train_csv, show_col_types = FALSE)
+  test_df <- read_csv(test_csv, show_col_types = FALSE)
+  
+  #outcomes
+  time_train  <- train_df$os_months
+  event_train <- train_df$os_event
+  time_test   <- test_df$os_months
+  event_test  <- test_df$os_event
+
+  # ids 
+  test_ids <- test_df %>% select(patient_id, sample_id)
+  
+  # predictors
+  pred_train <- train_df %>% select(-patient_id, -sample_id, -os_months, -os_event)
+  pred_test  <- test_df %>% select(-patient_id, -sample_id, -os_months, -os_event)
+  
+  # Drop the columns that have less than 2 
+  print("Drop columns that have levels less than 2.")
+  keep_cols <- names(pred_train)[
+  sapply(pred_train, function(x) {
+    length(unique(x[!is.na(x)])) >= 2
+  })
+]
+  pred_train <- pred_train[, keep_cols, drop = FALSE]
+  pred_test  <- pred_test[, intersect(keep_cols, colnames(pred_test)), drop = FALSE]  
+  
+  # Change into factors 
+  pred_train <- pred_train %>% mutate(across(where(is.character), as.factor))
+  pred_test  <- pred_test  %>% mutate(across(where(is.character), as.factor))
+  
+
+  print("Now, create design matrices and lock training encoding")
+  
+  X_train <- model.matrix(~ . -1, data = pred_train, na.action = na.pass)
+  tt <- terms(~ . -1, data = pred_train)
+  X_test  <- model.matrix(tt, data = pred_test, na.action = na.pass)
+  
+  print("Algin the columns ")
+  
+  missing_cols <- setdiff(colnames(X_train), colnames(X_test))
+  if (length(missing_cols) > 0) {
+    X_test <- cbind(X_test, matrix(0, nrow(X_test), length(missing_cols),
+                                   dimnames = list(NULL, missing_cols))
+    )
+  }
+  X_test <- X_test[, colnames(X_train), drop = FALSE]
+  
+  print("Now, create xgb objects")
+  
+  label_cox <- ifelse(event_train == 1, time_train, -time_train)
+  dtrain <- xgb.DMatrix(data = X_train, label = label_cox)
+  dtest  <- xgb.DMatrix(data = X_test)
+
+  print("Set the grid. Validating with 5 fold cross validation and early stopping in progress. ")
+  
+  set.seed(123)
+  base_param <- list(objective = "survival:cox", eval_metric = "cox-nloglik")
+  grid <- expand.grid(
+    eta = c(0.01, 0.05, 0.1), max_depth = c(2, 4, 6), 
+    subsample = c(0.5, 0.7, 1.0), colsample_bytree = c(0.7, 1.0)
+  )
+  
+  out <- vector("list", nrow(grid))
+  start <- Sys.time()
+  for (i in seq_len(nrow(grid))) {
+    params_i <- c(base_param, as.list(grid[i, ]))
+
+    cv_i <- xgb.cv(
+      params = params_i, data = dtrain, nrounds = 1000,
+      nfold = 5, early_stopping_rounds = 50, verbose = 0
+    )
+    
+   out[[i]] <- tibble::tibble(
+     trial = i, best_iteration = cv_i$best_iteration,
+     best_score = cv_i$evaluation_log$test_cox_nloglik_mean[cv_i$best_iteration],
+     eta = grid$eta[i], max_depth = grid$max_depth[i], subsample = grid$subsample[i], colsample_bytree = grid$colsample_bytree[i]
+)
+  }
+  
+  end <- Sys.time()
+  print(paste("Run time: ", end- start))
+
+  res <- bind_rows(out) %>% arrange(best_score)
+  best <- res[1, ]
+  
+  print(best)
+  
+  print("Now, use the best parameter to train the final model ")  
+  best_params <- c(base_param, as.list(best[, c("eta", "max_depth", "subsample", "colsample_bytree")]))
+  final_bst <- xgb.train(params = best_params, data = dtrain, nrounds = best$best_iteration, verbose = 0)
+
+  print("Now, predict the model and get cindex")
+  
+  risk_test <- as.numeric(predict(final_bst, dtest))
+  
+  # sanity check 
+  print(c(n_test = nrow(test_df), n_Xtest = nrow(X_test), n_pred = length(risk_test)))
+  
+  df_eval <- tibble(row_id = seq_len(nrow(test_df)), time = as.numeric(time_test),
+                                     event = as.integer(event_test), risk = risk_test)
+  
+  # df_eval <- data.frame(time = as.numeric(time_test), event = as.integer(event_test), risk = risk_test)
+  df_eval <- df_eval[complete.cases(df_eval), ]
+  cidx <- survival::concordance(Surv(df_eval$time, df_eval$event) ~ I(-df_eval$risk), data = df_eval)$concordance
+  
+  print("Now, save the outputs!")
+    xgb.save(final_bst, file.path("single_models", paste0("xgb_cox_", tag, ".json")))
+  write_csv(best, file.path("single_models", paste0("best_params_", tag, ".csv")))
+
+  pred_out <- tibble(
+    patient_id = test_ids$patient_id[df_eval$row_id],
+    sample_id  = test_ids$sample_id[df_eval$row_id],
+    time = df_eval$time,
+    event = df_eval$event,
+    risk = df_eval$risk
+  )
+  write_csv(pred_out, file.path("single_predictions", paste0("test_risk_", tag, ".csv")))
+
+  tibble(model = tag, c_index = cidx, best_iteration = best$best_iteration)
+}
+  
+```
+
+### 3. Now, run the model for clinical, clinical + methylatoin, clinical + mrna, clinical + mutation, and clinical + all omics. Train and test files for omic files already include cilnical data from the datacleaning_pca.qmd file. 
+```{r}
+clinic <- run_xgb(file.path(omics_dir, "train_clinical.csv"),
+              file.path(omics_dir, "test_clinical.csv"),
+              "clinical")
+clinic$c_index
+```
+```{r}
+meth <- run_xgb(file.path(omics_dir, "train_meth.csv"),
+                file.path(omics_dir, "test_meth.csv"),
+                "methylation")
+meth$c_index
+
+```
+
+```{r}
+mrna <- run_xgb(file.path(omics_dir, "train_mrna.csv"),
+                file.path(omics_dir, "test_mrna.csv"), "mrna")
+mrna$c_index
+```
+```{r}
+mut <- run_xgb(file.path(omics_dir, "train_mut.csv"),
+               file.path(omics_dir, "test_mut.csv"), "mutation")
+mut$c_index
+```
+```{r}
+all <- run_xgb(file.path(omics_dir, "train_all_omics.csv"),
+               file.path(omics_dir, "test_all_omics.csv"), "all_omics")
+all$c_index
+```
+### 4. Put all files concordance index into a table. 
+```{r}
+cindex_tbl <- bind_rows(clinic, meth, mrna, mut, all)
+cindex_tbl
+```
+
+
+###5. Create Kaplan Meier Curve function for later use. 
+```{r}
+plt_km <- function( pred_csv, title = NULL, q_probs = seq(0, 1, 0.25), risk.table = TRUE, risk.table.y.text = FALSE, risk.table.y.text.col = FALSE, risk.table.height = 0.35, risk.table.fontsize = 3,...) {
+  # ... is included so that I can include additional arguments 
+  
+  df_eval <- readr::read_csv(pred_csv, show_col_types = FALSE) %>%
+    mutate(time  = as.numeric(time), event = as.integer(event),
+      risk  = as.numeric(risk)) %>%
+    filter(complete.cases(time, event, risk))
+
+  qs <- stats::quantile(df_eval$risk, probs = q_probs, na.rm = TRUE, names = FALSE)
+  qs <- unique(qs)
+
+  k <- length(qs) - 1
+  labels <- c("Low Risk", "Low-Medium Risk", "Medium-High Risk", "High Risk")
+  labels_use <- labels[seq_len(min(k, length(labels)))]
+
+  df_eval$risk_group <- cut(df_eval$risk, breaks = qs, include.lowest = TRUE,
+    labels = labels_use)
+
+  fit_km <- survival::survfit(survival::Surv(time, event) ~ risk_group, data = df_eval)
+
+  survminer::ggsurvplot(
+    fit_km, data = df_eval, risk.table = risk.table, pval = TRUE,
+    risk.table.height = risk.table.height, risk.table.y.text = risk.table.y.text,
+    risk.table.y.text.col = risk.table.y.text.col, risk.table.fontsize = risk.table.fontsize, break.time.by = 50, xlab = "Time (months)", ylab = "Survival Probability", title = title, legend.title = "Predicted Risk Group", legend.labs = levels(df_eval$risk_group), ggtheme = ggplot2::theme_classic(), tables.theme = survminer::theme_cleantable(),
+    ...
+  )
+}
+```
+
+### 6. Create Kaplan Meier Curves without the risk table 
+```{r}
+#   base_dir <- "C:/Users/USER/OneDrive/바탕 화면/Projects - R & Python/R Projects/ENAR"
+# setwd(base_dir)
+
+tags <- c("clinical", "methylation", "mutation", "mrna", "all_omics")
+plots <- lapply(tags, function(t) {
+  pred_csv <- file.path("single_predictions", paste0("test_risk_", t, ".csv"))
+  g <- plt_km(pred_csv, title = paste("Kaplan–Meier:", t), risk.table = FALSE)
+
+  g$plot + theme_classic(base_size = 14) + theme(legend.position = "none", 
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+          axis.title = element_text(size = 13), 
+          axis.text = element_text(size = 11), 
+          plot.margin = margin(12,12,12,12))
+})
+
+plots <- c(plots, list(patchwork::plot_spacer()))
+final_kp<- patchwork::wrap_plots(plots, ncol = 3, nrow = 2)
+ggsave(filename = "Kaplan Meier Curve.png", plot = final_kp, width= 14, height = 9, dpi = 300, bg = "white")
+
+# for (t in tags) {
+#   pred_csv <- file.path("single_predictions", paste0("test_risk_", t, ".csv"))
+#   print(plt_km(pred_csv, title = paste("Kaplan-Meier: ",t)))
+# }
+
+```
+### 7. Create Kaplan Meier Risk Tables 
+I split the risk tables and Kaplan–Meier curves into separate figures to prevent the plots from looking cramped when exported to PNG. 
+
+```{r}
+risk_tables <- lapply(tags, function(t){
+  pred_csv <- file.path("single_predictions", paste0("test_risk_", t, ".csv"))
+  g <- plt_km(pred_csv, title = paste("Kaplan–Meier:", t),risk.table = TRUE,  
+              risk.table.y.text = TRUE, risk.table.y.text.col = TRUE)
+  
+  rt <- g$table 
+  
+  rt + ggtitle(paste("Kaplan Meier:", t)) +
+    theme_classic(base_size = 12) + theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5),axis.title = element_blank(), axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10), plot.margin = margin(8, 8, 8, 8))
+})
+
+
+risk_tables <- c(risk_tables, list(patchwork::plot_spacer()))
+final_rt <- patchwork::wrap_plots(risk_tables, ncol =3, nrow = 2)
+ggsave("Risk Tables.png", final_rt, width = 14, height= 9, dpi = 300, bg = "white")
+
+
+```
+
