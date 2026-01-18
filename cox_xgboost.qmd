@@ -187,7 +187,7 @@ cindex_tbl
 ```
 
 
-###5. Create Kaplan Meier Curve function for later use. 
+### 5. Create Kaplan Meier Curve function for later use. 
 ```{r}
 plt_km <- function( pred_csv, title = NULL, q_probs = seq(0, 1, 0.25), risk.table = TRUE, risk.table.y.text = FALSE, risk.table.y.text.col = FALSE, risk.table.height = 0.35, risk.table.fontsize = 3,...) {
   # ... is included so that I can include additional arguments 
