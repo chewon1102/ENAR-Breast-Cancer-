@@ -335,7 +335,7 @@ The following object is masked from 'package:survival':
 [1] "Algin the columns "
 [1] "Now, create xgb objects"
 [1] "Set the grid. Validating with 5 fold cross validation and early stopping in progress. "
-[1] "Run time:  6.4488210161527"
+[1] "Run time:  3.58122793038686"
 # A tibble: 1 × 7
   trial best_iteration best_score   eta max_depth subsample colsample_bytree
   &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt; &lt;dbl&gt;     &lt;dbl&gt;     &lt;dbl&gt;            &lt;dbl&gt;
@@ -361,7 +361,7 @@ The following object is masked from 'package:survival':
 [1] "Algin the columns "
 [1] "Now, create xgb objects"
 [1] "Set the grid. Validating with 5 fold cross validation and early stopping in progress. "
-[1] "Run time:  6.99163235028585"
+[1] "Run time:  3.31700806617737"
 # A tibble: 1 × 7
   trial best_iteration best_score   eta max_depth subsample colsample_bytree
   &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt; &lt;dbl&gt;     &lt;dbl&gt;     &lt;dbl&gt;            &lt;dbl&gt;
@@ -386,7 +386,7 @@ The following object is masked from 'package:survival':
 [1] "Algin the columns "
 [1] "Now, create xgb objects"
 [1] "Set the grid. Validating with 5 fold cross validation and early stopping in progress. "
-[1] "Run time:  3.50351226727168"
+[1] "Run time:  3.56871241728465"
 # A tibble: 1 × 7
   trial best_iteration best_score   eta max_depth subsample colsample_bytree
   &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt; &lt;dbl&gt;     &lt;dbl&gt;     &lt;dbl&gt;            &lt;dbl&gt;
@@ -411,7 +411,7 @@ The following object is masked from 'package:survival':
 [1] "Algin the columns "
 [1] "Now, create xgb objects"
 [1] "Set the grid. Validating with 5 fold cross validation and early stopping in progress. "
-[1] "Run time:  5.2630079348882"
+[1] "Run time:  3.61805815299352"
 # A tibble: 1 × 7
   trial best_iteration best_score   eta max_depth subsample colsample_bytree
   &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt; &lt;dbl&gt;     &lt;dbl&gt;     &lt;dbl&gt;            &lt;dbl&gt;
@@ -436,7 +436,7 @@ The following object is masked from 'package:survival':
 [1] "Algin the columns "
 [1] "Now, create xgb objects"
 [1] "Set the grid. Validating with 5 fold cross validation and early stopping in progress. "
-[1] "Run time:  5.13352984984716"
+[1] "Run time:  4.2549397667249"
 # A tibble: 1 × 7
   trial best_iteration best_score   eta max_depth subsample colsample_bytree
   &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt; &lt;dbl&gt;     &lt;dbl&gt;     &lt;dbl&gt;            &lt;dbl&gt;
@@ -469,7 +469,9 @@ The following object is masked from 'package:survival':
 5 all_omics     0.715            214</code></pre>
 </div>
 </div>
-<p>###5. Create Kaplan Meier Curve function for later use.</p>
+</section>
+<section id="create-kaplan-meier-curve-function-for-later-use." class="level3">
+<h3 class="anchored" data-anchor-id="create-kaplan-meier-curve-function-for-later-use.">5. Create Kaplan Meier Curve function for later use.</h3>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb47"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a>plt_km <span class="ot">&lt;-</span> <span class="cf">function</span>( pred_csv, <span class="at">title =</span> <span class="cn">NULL</span>, <span class="at">q_probs =</span> <span class="fu">seq</span>(<span class="dv">0</span>, <span class="dv">1</span>, <span class="fl">0.25</span>), <span class="at">risk.table =</span> <span class="cn">TRUE</span>, <span class="at">risk.table.y.text =</span> <span class="cn">FALSE</span>, <span class="at">risk.table.y.text.col =</span> <span class="cn">FALSE</span>, <span class="at">risk.table.height =</span> <span class="fl">0.35</span>, <span class="at">risk.table.fontsize =</span> <span class="dv">3</span>,...) {</span>
 <span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a>  <span class="co"># ... is included so that I can include additional arguments </span></span>
