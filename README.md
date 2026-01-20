@@ -25,7 +25,7 @@ cox_xgboost.html and cox_xgboost.qmd has the model pipeline and contains concord
 
 ### How to Run 
 1. Clone this repository
-2. Open the datacleaning_pca.qmd file ('.qmd') in RStudio first.
+2. Open the datacleaning_pca.qmd file in RStudio first.
 3. Update the 'base_dir' path to match your local environment from the datacleaning_pca.qmd.
 4. Run the datacleaning_pca.qmd
 5. After running datacleaning_pca.qmd, run 'cox_xgboost.qmd.'
