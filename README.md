@@ -1,25 +1,32 @@
 # Breast Cancer Survival Prediction with Clinical and Multi-Omics Data 
 
-This repository contains R/Quarto code for survival modelling using Cox based machine learning method to evalute the impact of integrating multi-omics data on breast cancer survival prediction. 
+This repository contains R/Quarto code for survival modelling using Cox based machine learning method to evaluate the impact of integrating multi-omics data on breast cancer survival prediction. 
 
 ## Overview
-This project investigates breast cancer overall survival using clinical variables and multi omics data(mRNA expression, methylation, and mutation). Survival outcomes are modeled using extreme gradient boosting with a Cox partial likelihood objective. (Cox-XGBoost). 
+This project investigates breast cancer overall survival using clinical variables and multi omics data (mRNA expression, methylation, and mutation). Survival outcomes are modeled using extreme gradient boosting with a Cox partial likelihood objective. (Cox-XGBoost). 
 Models are trained using :
   1. clinical variables only
   2. clinical variables combined with a single omics layer
   3. clinical variables combined with all omics layer
 
-Predictive perforamnce is evaluated using the concordance index (c-index) and risk stratification divided by quantile is visaulized by Kaplan-Meier Curves. 
+Predictive performance is evaluated using the concordance index (c-index) and risk stratification divided by quantile is visaulized by Kaplan-Meier Curves. 
 
 ## Data Source
 Clinical and omics data were obtained from cBioPortal. 
 Processed data files are generated and saved under the 'clean_common' directory.  
+
+## Methods 
+  Cox XGBoost model with 5 fold cross-validation and grid search for hyperparameter tuning 
+  Evaluation metrics: concordance index 
+  Visualization: Kaplan-Meier Survival Curves and risk tables 
 
 ## Repository Structure 
 'Old Code' folder contains old code used to generate the cox_xgboost.qmd and datacleaning_pca.qmd 
 'clean_common' folder ...
 'clean_full' folder ...
 'splits' folder ...
+
+In the main branch, 
 cox_xgboost.html and cox_xgboost.qmd has the model pipeline and contains concordance index, risk tables, and Kaplan-Meier Curves. 
 ...
 
