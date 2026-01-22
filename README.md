@@ -53,6 +53,6 @@ The model integrating all omics layers achieved the highest performance with a c
 Kaplan-Meier curves and risk table demonstrate clear separation between predicted risk groups. 
 
 ## Authors 
-Chaewon Oh (Brown University), Chingwen Mai ( please double check! I might have spelled your name wrong ) 
+Chaewon Oh (Brown University), Ching-Wen Mai 
 
 
