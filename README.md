@@ -17,8 +17,8 @@ Processed data files are generated and saved under the 'clean_common' directory.
 
 ## Methods 
   Cox XGBoost model with 5 fold cross-validation and grid search for hyperparameter tuning 
-  Evaluation metrics: concordance index 
-  Visualization: Kaplan-Meier Survival Curves and risk tables 
+  - Evaluation metrics: concordance index 
+  - Visualization: Kaplan-Meier Survival Curves and risk tables 
 
 ## Repository Structure 
 Stage 1: Data cleaning & feature engineering (`datacleaning_pca.qmd`)
