@@ -21,14 +21,23 @@ Processed data files are generated and saved under the 'clean_common' directory.
   Visualization: Kaplan-Meier Survival Curves and risk tables 
 
 ## Repository Structure 
-'Old Code' folder contains old code used to generate the cox_xgboost.qmd and datacleaning_pca.qmd 
-'clean_common' folder ...
-'clean_full' folder ...
-'splits' folder ...
+Stage 1: Data cleaning & feature engineering (`datacleaning_pca.qmd`)
+1. `input/` — raw tab-delimited files from cBioPortal (clinical + omics).
+2. `output/clean_full/` — intermediate cleaned outputs (e.g., `clinical_master.csv`).
+3. `output/splits/` — train/test identifiers (e.g., `idx_train.rds`, `train_ids.csv`, `test_ids.csv`).
+4. `output/clean_common/` — final modeling datasets (train/test CSVs for each feature set):
+   1. `train_clinical.csv`, `test_clinical.csv`
+   2. `train_mrna.csv`, `test_mrna.csv`
+   3. `train_meth.csv`, `test_meth.csv`
+   4. `train_mut.csv`, `test_mut.csv`
+   5. `train_all_omics.csv`, `test_all_omics.csv`
 
-In the main branch, 
-cox_xgboost.html and cox_xgboost.qmd has the model pipeline and contains concordance index, risk tables, and Kaplan-Meier Curves. 
-...
+Stage 2: Cox-XGBoost modeling & evaluation (`cox_xgboost.qmd`)
+1. Input: train/test CSVs from `output/clean_common/`.
+2. Output:
+   1. `single_models/` — trained models (`xgb_cox_*.json`) and selected hyperparameters (`best_params_*.csv`).
+   2. `single_predictions/` — test-set risk predictions (`test_risk_*.csv`).
+   3. Figures (repo root): `Kaplan Meier Curve.png`, `Risk Tables.png`.
 
 ### How to Run 
 1. Clone this repository
